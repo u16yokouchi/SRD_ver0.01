@@ -1,0 +1,278 @@
+# 必要なライブラリの読み込み
+library(shiny)
+library(rstan)
+library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(loo)
+library(coda)
+library(e1071)
+library(dplyr)
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# UIの定義
+ui <- fluidPage(
+  titlePanel("Rater Severity Analysis with Stan"),
+  sidebarLayout(
+    sidebarPanel(
+      textAreaInput("examineeData", "Paste first facet data (ExamineeID) here without header information:", rows = 8),
+      textAreaInput("timeData", "Paste second facet data (TimeID) here without header information:", rows = 8),
+      textAreaInput("scoreData", "Paste third row data (Score) here without header information:", rows = 8),
+      actionButton("run_analysis", "Run Analysis")
+    ),
+    mainPanel(
+      plotOutput("severityPlot"),
+      verbatimTextOutput("waicOutput"),
+      verbatimTextOutput("rmseOutput"),
+      verbatimTextOutput("pppOutput"),
+      verbatimTextOutput("infitOutfitStats"), # Infit/Outfit MNSQとZSTDの表示用
+      verbatimTextOutput("thetaStats"),
+      verbatimTextOutput("severityStats"),
+      verbatimTextOutput("essOutput"),
+      verbatimTextOutput("divergentOutput")
+    )
+  )
+)
+
+#calculate infit/outfit 
+calculate_fit_statistics <- function(data,facter){
+  facter_sym <- rlang::sym(facter)
+  #y_pre<-data$Ypre
+  W_ni<-data%>%group_by(!!facter_sym)%>%summarise(Variance = var(Ypre), .groups = 'drop')
+  #C_ni<-data%>%group_by(!!facter_sym)%>%summarise(Kurtosis = kurtosis(Ypre), .groups = 'drop')
+  residuals <-data%>%group_by(!!facter_sym)%>%summarise(resi=mean(Residuals))
+  Z_ni<-residuals$resi / sqrt(W_ni$Variance)
+  
+  outfit_mnsq <-(Z_ni^2)/length(Z_ni)#sum(Z_ni^2)/length(Z_ni)
+  #outfit_qi<-(sum(C_ni$Kurtosis/W_ni$Variance^2)/length(Z_ni)^2)-1/length(Z_ni)
+  #outfit_qi<-((C_ni$Kurtosis/W_ni$Variance^2)/length(Z_ni)^2)-1/length(Z_ni)
+  #outfit_zstd <- ((outfit_mnsq^(1/3)-1)*(3/outfit_qi))+outfit_qi/3
+  outfit_zstd <- scale(outfit_mnsq)[1:length(Z_ni),1]
+  infit_mnsq <- (W_ni$Variance*Z_ni^2)/(W_ni$Variance)#sum(W_ni$Variance*Z_ni^2)/sum(W_ni$Variance)
+  #infit_qi<-sum(C_ni$Kurtosis-W_ni$Variance^2)/(sum(W_ni$Variance))^2
+  #infit_qi<-(C_ni$Kurtosis-W_ni$Variance^2)/((W_ni$Variance))^2
+  #infit_zstd <- ((infit_mnsq^(1/3)-1)*(3/infit_qi))+infit_qi/3
+  infit_zstd <- scale(infit_mnsq)[1:length(Z_ni),1]
+  # Return results as a list
+  list(
+    Infit_MNSQ = infit_mnsq,
+    Infit_ZSTD = infit_zstd,
+    Outfit_MNSQ = outfit_mnsq,
+    Outfit_ZSTD = outfit_zstd
+  )
+}
+
+# サーバーの定義
+server <- function(input, output) {
+  observeEvent(input$run_analysis, {
+    # データの読み込みとクリーニング
+    examineeIds <- as.numeric(unlist(strsplit(input$examineeData, "\\s+", perl = TRUE)))
+    timeIds <- as.numeric(unlist(strsplit(input$timeData, "\\s+", perl = TRUE)))
+    scores <- as.numeric(unlist(strsplit(input$scoreData, "\\s+", perl = TRUE)))
+    
+    # NA値のチェック
+    if (any(is.na(examineeIds)) || any(is.na(timeIds)) || any(is.na(scores))) {
+      stop("Input data contains non-numeric values or missing entries.")
+    }
+    
+    # 元のデータフレームの作成
+    data <- tibble(ExamineeID = examineeIds, TimeID = timeIds, Score = scores)
+    data_rb<-tibble(ExamineeID = examineeIds, TimeID = data$TimeID%>%max()+1, Score=1)
+    dataR<-rbind(data,data_rb)
+    dataR<-dataR%>%mutate(inter=ExamineeID*TimeID)
+    
+    # Stanデータリストの作成
+    datalist <- list(
+      N = nrow(dataR),
+      J = max(dataR$ExamineeID),
+      T = max(dataR$TimeID),
+      K = max(dataR$Score),
+      I = length(unique(dataR$inter)),
+      ExamineeID = dataR$ExamineeID,
+      TimeID = dataR$TimeID,
+      ETinter=dataR$inter%>%as_factor()%>%as.numeric(),
+      X = dataR$Score
+    )
+    
+    stan_model_code <- "
+    data {
+      int <lower=1> J; // n_examinee
+      int <lower=1> T; // n_time
+      int <lower=0> K; // n_score
+      int <lower=1> N; // n_samples
+      int <lower=1> I;
+      int <lower=1, upper=J> ExamineeID[N];
+      int <lower=1, upper=T> TimeID[N];
+      int <lower=1, upper=I> ETinter[N];
+      int <lower=0, upper=K> X[N];
+    }
+    transformed data {
+      vector[K] c = cumulative_sum(rep_vector(1, K)) - 1;
+    }
+    parameters {
+      vector[J] theta;
+      real<lower=0> alpha_t[T-1];
+      real<lower=0> alpha_i[I];
+      vector[T-1] beta_t;
+      vector[K-2] beta_k;
+      vector[I] beta_i;
+    }
+    transformed parameters {
+      real<lower=0> trans_alpha_t[T];
+      vector[T] trans_beta_t;
+      vector[K-1] category_est;
+      vector[K] category_prm;
+      trans_alpha_t[1]=1.0/prod(alpha_t);
+      trans_beta_t[1]=-1*sum(beta_t);
+      trans_alpha_t[2:T]=alpha_t;
+      trans_beta_t[2:T]=beta_t;
+      category_est[1:(K-2)] = beta_k;
+      category_est[K-1] = -1 * sum(beta_k);
+      category_prm = cumulative_sum(append_row(0, category_est));
+    }
+    model {
+      trans_alpha_t~lognormal(0,1);
+      alpha_i~lognormal(0,1);
+      trans_beta_t~normal(0,1);
+      theta ~ normal(0, 1);
+      beta_t ~ normal(0, 1);
+      beta_i ~ normal(0, 1);
+      category_est ~ normal(0, 1);
+    
+      for (n in 1:N) {
+        X[n] ~ categorical_logit(1.7*trans_alpha_t[TimeID[n]]*alpha_i[ETinter[n]]*(c*(theta[ExamineeID[n]]-trans_beta_t[TimeID[n]])-beta_i[ETinter[n]]-category_prm));
+      }
+    }
+    generated quantities {
+      vector[N] log_lik;
+      int X_pre[N];
+      vector[N] residuals;
+      for (n in 1:N) {
+        log_lik[n] = categorical_logit_log(X[n],1.7*trans_alpha_t[TimeID[n]]*alpha_i[ETinter[n]]*(c*(theta[ExamineeID[n]]-trans_beta_t[TimeID[n]])-beta_i[ETinter[n]]-category_prm));
+        X_pre[n] = categorical_rng(softmax(1.7*trans_alpha_t[TimeID[n]]*alpha_i[ETinter[n]]*(c*(theta[ExamineeID[n]]-trans_beta_t[TimeID[n]])-beta_i[ETinter[n]]-category_prm)));
+        residuals[n] = X[n] - X_pre[n];
+      }
+    }
+    "
+    
+    stan_model <- stan_model(model_code = stan_model_code)
+    
+    #fit <- sampling(stan_model, data = data_irt, iter = 10000, warmup = 5000, chains = 4, control = list(adapt_delta = 0.98))
+    fit <- sampling(stan_model, data = datalist,seed=1234)
+    
+    # Thetaの統計量を計算
+    theta <- rstan::extract(fit, pars = "theta")$theta
+    theta_mean <- apply(theta, 2, mean)
+    theta_sd <- apply(theta, 2, sd)
+    theta_ci <- t(apply(theta, 2, quantile, probs = c(0.025, 0.975)))
+    theta_rhat <- summary(fit, pars = "theta")$summary[,"Rhat"]
+    theta_se <- theta_sd / sqrt(nrow(theta))
+    
+    output$thetaStats <- renderPrint({
+      cat(sprintf("Theta Overall Mean: %.3f, SD: %.3f, SE: %.3f, CI: (%.3f, %.3f), Rhat: %.3f\n",
+                  mean(theta_mean), mean(theta_sd), mean(theta_se), mean(theta_ci[, 1]), mean(theta_ci[, 2]), mean(theta_rhat)))
+    })
+    
+    # Beta_tの統計量
+    beta_t <- rstan::extract(fit, pars = "trans_beta_t")$trans_beta_t
+    beta_t_mean <- apply(beta_t, 2, mean)
+    beta_t_sd <- apply(beta_t, 2, sd)
+    beta_t_ci <- t(apply(beta_t, 2, quantile, probs = c(0.025, 0.975)))
+    beta_t_rhat <- summary(fit, pars = "trans_beta_t")$summary[,"Rhat"]
+    beta_t_se <- beta_t_sd / sqrt(nrow(beta_t))
+    
+    output$severityStats <- renderPrint({
+      cat("Rater Severity (Beta_t) Statistics for each TimeID:\n")
+      for (t in 1:length(beta_t_mean)) {
+        cat(sprintf("TimeID %d: Mean: %.3f, SD: %.3f, SE: %.3f, CI: (%.3f, %.3f), Rhat: %.3f\n", 
+                    t, beta_t_mean[t], beta_t_sd[t], beta_t_se[t], beta_t_ci[t, 1], beta_t_ci[t, 2], beta_t_rhat[t]))
+      }
+    })
+    
+    severity_data <- data.frame(
+      Time = 1:(max(dataR$TimeID)-1),
+      Severity = beta_t_mean[-max(dataR$TimeID)]
+    )
+    
+    output$severityPlot <- renderPlot({
+      ggplot(severity_data, aes(x = Time, y = Severity)) +
+        geom_line() +
+        geom_point() +
+        labs(title = "Rater Severity over Time", x = "Time", y = "Severity") +
+        theme_minimal()
+    })
+    
+    #RMSEを計算
+    theta_mean <- colMeans(rstan::extract(fit, pars = "theta")$theta)
+    beta_t_mean <- colMeans(rstan::extract(fit, pars = "trans_beta_t")$trans_beta_t)
+    predicted_scores <- numeric(datalist$N)
+    for (i in 1:datalist$N) {
+      eta <- theta_mean[datalist$ExamineeID[i]] - beta_t_mean[datalist$TimeID[i]]
+      logit_inv <- 1 / (1 + exp(-eta))
+      predicted_scores[i] <- logit_inv * (datalist$K - 1) + 1  # スコア範囲に合わせて調整
+    }
+    actual_scores <- datalist$X
+    rmse <- sqrt(mean((actual_scores - predicted_scores)^2))
+    
+    # WAICの計算
+    log_lik <- extract_log_lik(fit, parameter_name = "log_lik")
+    waic_res <- waic(log_lik, cores = parallel::detectCores())
+    waic_estimate <- waic_res$estimates["waic", "Estimate"]
+    
+    output$waicOutput <- renderPrint({
+      cat(sprintf("RMSE: %.3f\nWAIC: %.2f\n", rmse, waic_estimate))
+      if (any(waic_res$diagnostics$pareto_k > 0.7)) {
+        cat("Warning: Some Pareto k diagnostic values are too high. See help('pareto-k-diagnostic') for details.\n")
+      }
+    })
+    
+    # Effective sample sizeの計算
+    ess <- effectiveSize(as.mcmc(as.matrix(fit)))
+    output$essOutput <- renderPrint({
+      cat("Effective Sample Size (ESS):\n")
+      print(ess)
+    })
+    
+    # Divergent transitionの計算
+    sampler_params <- rstan::get_sampler_params(fit, inc_warmup = FALSE)
+    divergences <- sum(sapply(sampler_params, function(x) x[, "divergent__"]))
+    output$divergentOutput <- renderPrint({
+      cat(sprintf("Number of Divergent Transitions: %d\n", divergences))
+    })
+    
+    # Posterior Predictive P-valueの計算
+    dft<-rstan::extract(fit)
+    y_pre<-dft$X_pre
+    obs_stat <- mean(datalist$X)
+    pred_stat <- apply(y_pre, 1, mean)
+    ppp_value <- mean(pred_stat >= obs_stat)
+    output$pppOutput <- renderPrint({
+      cat(sprintf("Posterior Predictive P-value (PPP): %.3f\n", ppp_value))
+    })
+    
+    # Infit/Outfit MNSQとZSTDの計算と表示
+    dft<-rstan::extract(fit)
+    #datpre<-data%>%mutate(Ypre=apply(dft$X_pre, 2, mean)[1:nrow(data)],Residuals=Score-Ypre)
+    datpre<-dataR%>%mutate(Ypre=apply(dft$X_pre, 2, mean),Residuals=apply(dft$residuals, 2, mean))
+    result_time<-calculate_fit_statistics(datpre,"TimeID")
+    result_examinee<-calculate_fit_statistics(datpre,"ExamineeID")
+    
+    output$infitOutfitStats <- renderPrint({
+      cat("Infit/Outfit MNSQ and ZSTD for Examinee:\n")
+      invisible(lapply(1:datalist$J, function(j) {
+        cat(sprintf("Examinee %d: Infit MNSQ: %.3f, Outfit MNSQ: %.3f, Infit ZSTD: %.3f, Outfit ZSTD: %.3f\n", 
+                    j, result_examinee$Infit_MNSQ[j], result_examinee$Outfit_MNSQ[j], result_examinee$Infit_ZSTD[j], result_examinee$Outfit_ZSTD[j]))
+      }))
+      cat("Infit/Outfit MNSQ and ZSTD for Time:\n")
+      invisible(lapply(1:(datalist$T-1), function(t) {
+        cat(sprintf("Time %d: Infit MNSQ: %.3f, Outfit MNSQ: %.3f, Infit ZSTD: %.3f, Outfit ZSTD: %.3f\n", 
+                    t, result_time$Infit_MNSQ[t], result_time$Outfit_MNSQ[t], result_time$Infit_ZSTD[t], result_time$Outfit_ZSTD[t]))
+      }))
+    })
+  })
+}
+
+shinyApp(ui = ui, server = server)
+
